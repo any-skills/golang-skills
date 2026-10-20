@@ -28,8 +28,9 @@ Covers:
 - Interface placement strategy (consumer-defined interfaces)
 - Bootstrap / composition root wiring
 - Over-abstraction detection and rollback
+- Context principles: propagate / derive / detach-with-timeout (`WithoutCancel`)
 
-**Trigger keywords:** clean architecture, 整洁架构, hexagonal, ports and adapters, 依赖反转, domain, application, infra, bootstrap, 组合根
+**Trigger keywords:** clean architecture, 整洁架构, hexagonal, ports and adapters, 依赖反转, domain, application, infra, bootstrap, 组合根, context, WithoutCancel, DetachTimeout
 
 **Usage:** mention any trigger keyword or type `/golang-clean-architecture` in the prompt.
 

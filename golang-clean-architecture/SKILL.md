@@ -3,12 +3,13 @@ name: golang-clean-architecture
 description: >-
   Go 项目整洁架构（Clean Architecture）实践指南。涵盖四环分层规则、依赖方向判定、
   domain/application/adapter/infra 职责划分、组合根（bootstrap）编排、
-  Go 接口放置策略、过度抽象识别与回退。
+  Go 接口放置策略、过度抽象识别与回退、context 传递/派生/脱离取消原则。
   适用：新建或重构 Go 服务的分层结构、审查依赖方向、判断某个 import 是否合规、
-  迁移 DDD 分层 / 洋葱架构到整洁架构。
+  迁移 DDD 分层 / 洋葱架构到整洁架构、审查 context 与日志透传。
   关键词：clean architecture, 整洁架构, onion, hexagonal, 六边形, 端口适配器,
   ports and adapters, 依赖反转, 分层, layer, ring, domain, application,
-  adapter, infra, infrastructure, bootstrap, composition root, 组合根。
+  adapter, infra, infrastructure, bootstrap, composition root, 组合根,
+  context, WithoutCancel, DetachTimeout, 生命周期 ctx。
 ---
 
 # Go 整洁架构实践指南
@@ -187,6 +188,75 @@ application 层调用这些函数，自己不重复实现：
 if domainrec.IsNewUser(stats.TotalDays, n.NewUserThreshold) { ... }
 ```
 
+## Context 使用原则
+
+一句话：**能传就传；要限时就派生；父 ctx 已死还要收尾时，脱离取消但必须设超时。**
+
+Context 不属于某一环的专属概念，但贯穿 bootstrap → adapter → application → infra。
+分层合规不等于 context 用对；审查时两者一起看。
+
+### 三类用法
+
+| 场景 | 做法 | 说明 |
+|------|------|------|
+| **传递** | 原样往下传当前 `ctx` | 请求链路、用例调用、仓储/客户端、`slog.*Context` |
+| **派生** | `WithTimeout` / `WithCancel` / `WithDeadline` | 需要独立超时、局部取消时，从上游派生，不要另起无关的 `Background` |
+| **脱离取消** | `WithoutCancel` + **明确超时** | 生命周期 ctx 已取消后仍要做的收尾（关连接、释放租约、退出日志） |
+
+```go
+// ✅ 传递：请求 ctx 一路带到应用层与日志
+func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
+    result, err := h.uc.Verify(r.Context(), cmd)
+    // ...
+}
+
+// ✅ 派生：对外部调用限时
+func (r *Repo) Find(ctx context.Context, id string) error {
+    ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+    return r.db.WithContext(ctx).First(...).Error
+}
+
+// ✅ 脱离取消 + 超时：shutdown 后 cleanup 不被 context.Canceled 打断，也不会卡死
+func cleanup(lifecycleCtx context.Context) {
+    closeCtx, cancel := context.WithTimeout(context.WithoutCancel(lifecycleCtx), 5*time.Second)
+    defer cancel()
+    _ = db.Close()
+    logger.ErrorContext(closeCtx, "db close done")
+}
+```
+
+### 不要混用的边界
+
+| 对象 | 该用哪个 ctx | 原因 |
+|------|--------------|------|
+| HTTP/gRPC 业务处理、业务日志 | **request ctx**（`r.Context()`） | 带 trace / user / 客户端断开取消 |
+| main / bootstrap 启动日志、选主、注册 | **lifecycle ctx**（信号通知的根 ctx） | 进程级，不是某次请求 |
+| `cleanup` / `app.Start` 返回后的退出日志 | **脱离取消 + 超时** | lifecycle 通常已 cancelled |
+| readiness / liveness 探针 | **独立短超时 Background**（或等价） | 不要绑 lifecycle，避免停机时探针因 cancel 误抖 |
+| 后台 worker 主循环 | 从 lifecycle **派生** | 停机可取消；单次任务再套超时 |
+
+```go
+// ❌ 启动日志丢掉 lifecycle ctx
+logger.Info("channel registered", "channel", code)
+
+// ✅
+logger.InfoContext(ctx, "channel registered", "channel", code)
+
+// ❌ cleanup 仍用已取消的 lifecycle ctx 做 I/O
+func cleanup() { redis.Ping(lifecycleCtx) } // 常直接 context.Canceled
+
+// ❌ 脱离取消却不设超时 —— 外部依赖卡住会拖死进程退出
+closeCtx := context.WithoutCancel(lifecycleCtx)
+```
+
+### 与分层的关系
+
+- **domain / application**：方法签名带 `ctx context.Context`，只传递或按需派生；不创建进程级根 ctx。
+- **adapter**：从 `r.Context()` / 消息消费 ctx 传入 application；异常路径日志必须 `*Context`。
+- **bootstrap / main**：持有 lifecycle ctx；启动用它；收尾用脱离取消 + 超时。
+- **禁止**：application 为了“方便”自己 `context.Background()` 发起外部调用（丢失取消与 trace）。
+
 ## 审查步骤
 
 对已有项目做整洁架构合规审查时：
@@ -196,9 +266,35 @@ if domainrec.IsNewUser(stats.TotalDays, n.NewUserThreshold) { ... }
 3. **adapter 和 infra 互引** — 在整洁架构下合法，不必修
 4. **识别 application 层的 infra 泄漏** — `net/http` 客户端调用、直接 `*redis.Client` 等
 5. **检查 domain 层是否有不应存在的接口** — 仅为外环服务的接口不属于 domain
+6. **扫描无 Context 的日志** — 请求/启动路径避免 `logger.Info/Error`（无 ctx）；应用 `InfoContext/ErrorContext`
+7. **扫描 cleanup / shutdown** — 收尾是否 `WithoutCancel` + timeout，避免已取消父 ctx 或无限等待
+8. **扫描错误的 Background** — 业务链路中的 `context.Background()` 多为漏传；探针/纯 init 除外并应注释原因
 
 ```bash
 # 快速验证核心规则
 rg 'internal/infra' internal/domain/      # 应为 0
 rg 'internal/(infra|adapter|bootstrap)' internal/application/  # 应为 0
+
+# Context / 日志透传（按项目路径调整）
+rg 'logger\.(Info|Warn|Error)\(' --glob '*.go'   # 业务路径应优先 *Context
+rg 'context\.Background\(\)' --glob '*.go'      # 业务链路命中需说明理由
 ```
+
+## 写作与出版规范（面向读者的正文语言）
+
+在为读者撰写与出版的书稿中，所有技术说明必须使用面向读者的、连贯的正文语言呈现；禁止将审稿笔记、TODO、内部讨论、审阅意见或实现跟踪直接留在正文或示例代码注释中。请将以下规则纳入写作检查清单：
+
+- 规则：写书时不做审稿笔记。任何对实现变更、比较或借鉴的说明都应改写为中性、面向读者的正文（解释为何采用该方案、备选方案与权衡），不得保留“审稿备注/实施注记”类文字。
+  - 禁止示例（不得出现在正文或代码注释中）：
+    - “参考 beauty 做了调整” / “已按 reviewer 建议改动”
+    - “TODO: 后续再补充实现细节” / “待与某某讨论后再改”
+    - “审稿意见：这里应该改成…”
+  - 允许示例（应改写为此类形式）：
+    - “为保证可恢复性，本设计将审批从工具执行中剥离，改为循环级的原子暂停与续跑，以便把待批项写入 checkpoint 并支持跨请求恢复。”
+    - “权衡：将审批放在循环层避免了无法序列化的阻塞 goroutine，但代价是需要在 Run/Continue 接口上增加恢复语义。”
+  - 文本模板（便于把审稿笔记改写为正文）：
+    - 审稿笔记 → 正文表述示例：
+      - “（审稿）X 不合适” → “为保证 Y，选择方案 A，而非方案 B，原因是 …”
+      - “(待确认) 是否用 Z？” → “可选方案：使用 Z 可带来 …；但同时会引入 …，因此本书采用 …”
+
+简短说明：此规则保证书稿面向读者、叙述连贯、可复现；审稿记录与开发备忘应另存为作者工作记录或附录，不应进入最终正文或示例代码注释。
